@@ -1,0 +1,78 @@
+name: 一键自动同步 Fork 仓库（代码 + Tags + Releases + 附件）
+on:
+  workflow_dispatch: # 手动触发，推荐先手动测试
+  schedule: 
+    - cron: '0 */12 * * *' # 自动定时运行：每 12 小时（UTC时间）同步一次
+
+jobs:
+  sync-fork:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Step 1: 获取当前仓库信息，并查询上游（源）仓库
+      - name: Get current repository info
+        id: repo_info
+        run: |
+          REPO_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }})
+          DEFAULT_BRANCH=$(echo "$REPO_INFO" | jq -r '.default_branch')
+          UPSTREAM_FULL_NAME=$(echo "$REPO_INFO" | jq -r '.parent.full_name')
+          if [ "$UPSTREAM_FULL_NAME" == "null" ]; then
+            echo "错误：当前仓库不是 Fork 仓库，无法自动检测上游。"
+            exit 1
+          fi
+          echo "upstream_full_name=$UPSTREAM_FULL_NAME" >> $GITHUB_OUTPUT
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+      # Step 2: Checkout 你的 Fork 仓库
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.repo_info.outputs.default_branch }}
+          token: ${{ secrets.MY_GIT_TOKEN }}
+          fetch-depth: 0
+
+      # Step 3: 设置 Git 用户信息
+      - name: Set Git Identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # Step 4: 获取源仓库信息并设置远程
+      - name: Add upstream remote
+        id: upstream_info
+        run: |
+          UPSTREAM_REPO=${{ steps.repo_info.outputs.upstream_full_name }}
+          UPSTREAM_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/$UPSTREAM_REPO)
+          UPSTREAM_DEFAULT_BRANCH=$(echo "$UPSTREAM_INFO" | jq -r '.default_branch')
+          echo "upstream_default_branch=$UPSTREAM_DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+          git remote add upstream https://github.com/$UPSTREAM_REPO.git
+
+      # Step 5: 拉取源仓库的代码和 Tags，并推送 Tags
+      - name: Fetch upstream (code + tags)
+        run: git fetch upstream --tags
+
+      - name: Push all tags to your fork
+        run: git push origin --tags
+
+      # Step 6: 合并源仓库代码并推送到你的 Fork
+      - name: Merge upstream branch
+        run: |
+          git merge upstream/${{ steps.upstream_info.outputs.upstream_default_branch }} \
+            --allow-unrelated-histories -X theirs || echo "Already up-to-date."
+
+      - name: Push code to your fork
+        run: |
+          git remote set-url origin https://${{ secrets.MY_GIT_TOKEN }}@github.com/${{ github.repository }}.git
+          git push origin ${{ steps.repo_info.outputs.default_branch }}
+
+      # Step 7: 同步 Releases（使用第三方 Action，更稳定）
+      - name: Sync Releases
+        uses: aminya/sync-releases@v1
+        with:
+          source: "${{ steps.repo_info.outputs.upstream_full_name }}"
+          destination: "${{ github.repository }}"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          destination-token: ${{ secrets.MY_GIT_TOKEN }}
+          tag: "latest"
